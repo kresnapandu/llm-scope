@@ -25,7 +25,7 @@ jobs:
         run: cd sdk && hatch build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@v1
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: sdk/dist/
           password: ${{ secrets.PYPI_TOKEN }}
