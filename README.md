@@ -15,12 +15,143 @@
 
 - 🔍 **Automatic tracing** — one-line init patches OpenAI and Anthropic clients, no code changes needed
 - 💰 **Cost tracking** — real-time cost per call, per user, per feature with model-specific pricing
-- ⚠️ **Hallucination scoring** — 3-step pipeline (deterministic → TF-IDF → LLM-as-judge) on a sample of completions
+- ⚠️ **Hallucination detection** — 3-layer scoring pipeline runs automatically on a sample of your completions
 - 🔗 **LangChain integration** — traces chains, LLMs, retrievers, and tools as a native callback handler
 - 🌐 **FastAPI middleware** — auto-injects user_id and session context from HTTP headers
 - 🔔 **Smart alerting** — configurable rules for cost spikes, error rate, and hallucination score via Slack or webhook
 - 📊 **Live dashboard** — waterfall traces, cost charts, hallucination monitor, user leaderboard
 - 🐳 **Self-hostable** — one `make up` command to run everything with Docker Compose
+
+---
+
+## How Each Feature Works
+
+### 🔍 Automatic Tracing
+
+llm-scope uses Python's `wrapt` library to monkey-patch the OpenAI and Anthropic clients at initialization time. Every call to `client.chat.completions.create()` or `client.messages.create()` is transparently intercepted — you don't change a single line of your existing code.
+
+Each intercepted call becomes an **OpenTelemetry span** carrying:
+- Model name, temperature, and request parameters
+- Prompt text (redactable via `redact_prompts=True`)
+- Completion text (redactable via `redact_completions=True`)
+- Token counts (input + output)
+- Latency in milliseconds
+- Calculated cost in USD
+- Any context tags you inject via `trace_context()` (user_id, session_id, feature)
+
+Spans are sent via **OTLP gRPC** to the backend collector on port 4317 — the same open standard used by Datadog, Google Cloud Trace, and AWS X-Ray.
+
+---
+
+### 💰 Cost Tracking
+
+Cost is calculated locally on every span using built-in model pricing tables (no external API call required). The formula is simple:
+
+```
+cost = (input_tokens × input_price + output_tokens × output_price) / 1,000,000
+```
+
+Built-in prices cover all major OpenAI and Anthropic models. You can override them at init time:
+
+```python
+llmscope.init(
+    endpoint="...",
+    service_name="my-app",
+    model_prices={
+        "my-fine-tuned-model": {"input": 2.00, "output": 8.00}
+    }
+)
+```
+
+The backend aggregates costs hourly into a `metrics_hourly` table, enabling the dashboard to show cost-over-time charts, top models by spend, top features by spend, and a per-user leaderboard — all without scanning millions of raw span rows on every query.
+
+---
+
+### ⚠️ Hallucination Detection
+
+Hallucination detection is relevant when you use **RAG (Retrieval-Augmented Generation)** — a pattern where your app retrieves documents from a database and passes them to the LLM as context. The question llm-scope answers automatically: *"Did the LLM stay faithful to the documents it was given, or did it make things up?"*
+
+Scoring runs on a configurable sample of completions (default: 10%) through a **3-layer pipeline**, ordered from cheapest to most expensive:
+
+#### Layer 1 — Keyword Overlap (free, < 1ms)
+
+The simplest check: compare the vocabulary of the retrieved documents against the vocabulary of the LLM's completion. Words that appear in the completion but not in the context are potential hallucinations.
+
+```
+hallucination_ratio = out_of_context_words / total_meaningful_words
+
+ratio < 0.2  → likely faithful  → score ≈ 0.1  (stop here)
+ratio > 0.8  → likely hallucinated → score ≈ 0.85 (stop here)
+0.2–0.8      → inconclusive     → proceed to Layer 2
+```
+
+This catches the obvious cases for free — no model inference needed.
+
+#### Layer 2 — TF-IDF Cosine Similarity (~10ms, no API)
+
+For ambiguous cases, llm-scope computes the **cosine similarity** between the context and the completion using TF-IDF vectors. This captures semantic overlap beyond exact keyword matching — a completion that paraphrases the context correctly will still score high similarity even if it uses different words.
+
+```
+similarity = dot(ctx_vector, completion_vector) / (|ctx| × |completion|)
+
+hallucination_score = 1.0 - similarity
+
+score < 0.2  → faithful    (stop here)
+score > 0.7  → hallucinated (stop here)
+otherwise    → still ambiguous → proceed to Layer 3
+```
+
+Pure Python math, no GPU, no external dependencies.
+
+#### Layer 3 — LLM-as-Judge (~1–2s, uses OpenAI API)
+
+For cases that remain ambiguous after the first two layers, llm-scope sends the context and completion to a small, cheap judge model (default: `gpt-4o-mini`) with a faithfulness evaluation prompt:
+
+> *"Given this CONTEXT and this COMPLETION, is the completion faithful to the context? Reply FAITHFUL or UNFAITHFUL, then explain in one sentence."*
+
+```
+FAITHFUL   → score 0.1
+UNFAITHFUL → score 0.85
+```
+
+Only completions that couldn't be resolved by the first two layers reach this step, keeping API costs minimal.
+
+#### Score Interpretation
+
+| Score | Meaning |
+|-------|---------|
+| 0.0 – 0.2 | Faithful — completion is well-grounded in context |
+| 0.2 – 0.5 | Uncertain — manual review recommended |
+| 0.5 – 1.0 | Likely hallucinated — LLM made claims not in context |
+
+All scored spans appear in the **Hallucination Monitor** dashboard with their score, reasoning, full prompt, completion, and retrieved context — so you can review flagged responses and tune your RAG pipeline.
+
+---
+
+### 🔗 LangChain Integration
+
+The `LLMScopeCallbackHandler` implements LangChain's `BaseCallbackHandler` interface, so it plugs into any chain without modifying your chain code. It traces the full execution tree:
+
+- **Chains** — start/end time and nesting hierarchy
+- **LLM calls** — model, tokens, cost, latency (same as the OpenAI/Anthropic interceptors)
+- **Retrievers** — query, number of documents returned, top relevance score
+- **Tools** — name, input, output
+
+Retrieved documents are captured at the retriever step and passed to the hallucination judge when the parent LLM call completes — enabling accurate faithfulness scoring for the entire RAG flow end-to-end.
+
+---
+
+### 🔔 Smart Alerting
+
+Alert rules are configured in the dashboard and evaluated on every incoming batch of spans. Three rule types are supported:
+
+| Type | Triggers when |
+|------|--------------|
+| `cost_spike` | Total cost in a batch exceeds the threshold (USD) |
+| `error_rate` | Fraction of error spans in a batch exceeds the threshold (0–1) |
+| `high_hallucination` | Average hallucination score in a batch exceeds the threshold (0–1) |
+
+Notifications are sent via **Slack webhook** and/or a generic **HTTP webhook**, configurable per rule.
 
 ---
 
