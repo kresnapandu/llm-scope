@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "llmscope"
+name = "llmscope-kresnapandu"
 version = "0.1.0"
 description = "Self-hostable LLM observability SDK — trace, cost, and hallucination monitoring in one line."
 readme = "README.md"
