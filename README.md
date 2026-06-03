@@ -7,7 +7,7 @@
 
 **Self-hostable LLM observability — from one line of code to a full dashboard.**
 
-![Dashboard](docs/screenshot.png)
+<img width="1465" height="722" alt="Screenshot 2026-06-04 at 02 16 52" src="https://github.com/user-attachments/assets/5a687504-d209-49e9-bbfc-e22847b75c9e" />
 
 ---
 
