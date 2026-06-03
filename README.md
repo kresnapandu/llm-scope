@@ -155,6 +155,14 @@ Notifications are sent via **Slack webhook** and/or a generic **HTTP webhook**, 
 
 ---
 
+## Installation
+
+```bash
+pip install llmscope-kresnapandu
+```
+
+---
+
 ## Quick Start (30 seconds)
 
 ```bash
